@@ -1,0 +1,20 @@
+services:
+  dragonwilds:
+    image: ghcr.io/yorickr/dragonwilds:latest
+    # Or build locally: build: .
+    restart: unless-stopped
+    ports:
+      - "7777:7777/udp"
+    volumes:
+      - ./data:/home/steam/rs_server
+    environment:
+      # In-game: Settings -> "My Player Id".
+      OWNER_ID: "REPLACE_WITH_YOUR_PLAYER_ID"
+      SERVER_NAME: Dragonwilds
+      DEFAULT_WORLD_NAME: World
+      # WORLD_PASSWORD: ""
+      # ADMIN_PASSWORD: ""
+      AUTO_PAUSE: "true"
+      AUTO_PAUSE_TIMEOUT: "900"
+    # The shutdown poll is bounded at 28s, so give it room to flush the world.
+    stop_grace_period: 30s

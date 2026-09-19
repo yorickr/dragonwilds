@@ -1,0 +1,3 @@
+# Keep the build context to the one file the image needs.
+*
+!entrypoint.sh

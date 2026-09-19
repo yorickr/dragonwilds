@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise run lint
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise run test:unit
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image into the local daemon
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: dragonwilds:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - run: mise run test:integration

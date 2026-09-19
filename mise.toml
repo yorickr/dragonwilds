@@ -1,0 +1,35 @@
+[tools]
+bats = "latest"
+hadolint = "latest"
+shellcheck = "latest"
+
+[env]
+IMAGE = "dragonwilds:test"
+
+[tasks.lint]
+description = "shellcheck the shell sources and hadolint the Dockerfile"
+depends = ["lint:shell", "lint:docker"]
+
+[tasks."lint:shell"]
+description = "shellcheck entrypoint.sh and the test scripts"
+run = "shellcheck entrypoint.sh tests/integration/run.sh tests/integration/stub/RSDragonwildsServer.sh"
+
+[tasks."lint:docker"]
+description = "hadolint the Dockerfile"
+run = "hadolint Dockerfile tests/integration/Dockerfile.test"
+
+[tasks."test:unit"]
+description = "run the bats unit suite"
+run = "bats tests/unit"
+
+[tasks."test:integration"]
+description = "build the image and run the container test suite"
+run = "tests/integration/run.sh"
+
+[tasks.test]
+description = "unit then integration tests"
+depends = ["test:unit", "test:integration"]
+
+[tasks.build]
+description = "build the image locally"
+run = "docker build -t $IMAGE ."

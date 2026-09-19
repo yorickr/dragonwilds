@@ -1,0 +1,13 @@
+# The production image plus python3, which the stub server needs to bind a UDP
+# socket. Everything else -- entrypoint, user, paths -- is inherited unchanged.
+ARG BASE_IMAGE=dragonwilds:test
+# hadolint ignore=DL3006
+FROM ${BASE_IMAGE}
+# hadolint ignore=DL3066
+USER root
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-minimal \
+    && rm -rf /var/lib/apt/lists/*
+# hadolint ignore=DL3066
+USER steam

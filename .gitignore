@@ -1,0 +1,11 @@
+# Test artifacts
+/tests/tmp/
+/data/
+*.log
+
+# Editor cruft
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
