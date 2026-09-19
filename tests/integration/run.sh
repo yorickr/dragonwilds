@@ -22,7 +22,7 @@ cleanup() {
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     fi
     if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
-        rm -rf "$WORKDIR"
+        remove_workdir "$WORKDIR"
     fi
 }
 trap cleanup EXIT
@@ -69,6 +69,14 @@ file_exists() {
 
 log_has() {
     docker logs "$CONTAINER" 2>&1 | grep -q "$1"
+}
+
+# The container writes into the volume as uid 1000; if the tests run as another
+# uid, only a container can clean those files up again.
+remove_workdir() {
+    rm -rf "$1" 2>/dev/null && return 0
+    docker run --rm -v "$1:/w" --entrypoint /bin/sh "$TEST_IMAGE" -c 'rm -rf /w/..?* /w/.[!.]* /w/*' >/dev/null 2>&1 || true
+    rm -rf "$1" 2>/dev/null || true
 }
 
 new_workdir() {
@@ -146,32 +154,48 @@ if wait_for 30 "the stub to record its pid" file_exists "$WORKDIR/data/stub.pid"
         pass "3: an inbound datagram resumed the server"
     fi
 
+    # Shutdown matters most from the PAUSED state: a STOPped process can only
+    # handle TERM if CONT was delivered first.
+    if wait_for 30 "the watcher to pause the stub again" state_is "$STUB_PID" T; then
+        say "stub is paused; stopping the container"
+    fi
+
     START="$(date +%s)"
     docker stop -t 30 "$CONTAINER" >/dev/null
     ELAPSED=$(( $(date +%s) - START ))
     EXIT_CODE="$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER")"
     SIGNALS="$(tr '\n' ' ' < "$WORKDIR/data/signals.log" 2>/dev/null || true)"
 
-    if [[ "$SIGNALS" == *"CONT TERM"* ]]; then
-        pass "4: the stub received CONT then TERM (log: $SIGNALS)"
+    # A paused process that ran its TERM handler and exited cleanly proves the
+    # entrypoint sent CONT before TERM; had it sent TERM alone, the stub would
+    # still be STOPped and Docker would have SIGKILLed it at the grace period.
+    if [[ "$SIGNALS" == *"TERM EXITED"* ]]; then
+        pass "4: the paused stub handled TERM and exited cleanly (CONT preceded it)"
     else
-        fail "4: expected CONT then TERM in the signal log, got: '$SIGNALS'"
+        fail "4: expected the stub to handle TERM and exit, signal log was: '$SIGNALS'"
+    fi
+    if log_has 'stopping: CONT then TERM to pgid'; then
+        pass "4b: the entrypoint logged CONT-then-TERM"
+    else
+        fail "4b: no CONT-then-TERM line in the container logs"
     fi
     if [ "$EXIT_CODE" = "0" ]; then
-        pass "4b: the container exited 0"
+        pass "4c: the container exited 0"
     else
-        fail "4b: the container exited $EXIT_CODE, expected 0"
+        fail "4c: the container exited $EXIT_CODE, expected 0"
     fi
-    if [ "$ELAPSED" -lt 30 ]; then
-        pass "4c: shutdown took ${ELAPSED}s, inside the 30s grace period"
+    # The on_term poll is bounded at 28s; a clean stop is near-instant, so a slow
+    # shutdown here means TERM was never handled.
+    if [ "$ELAPSED" -lt 15 ]; then
+        pass "4d: shutdown took ${ELAPSED}s, well inside the 30s grace period"
     else
-        fail "4c: shutdown took ${ELAPSED}s, at or past the 30s grace period"
+        fail "4d: shutdown took ${ELAPSED}s -- the stub did not handle TERM promptly"
     fi
 fi
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 CONTAINER=""
-rm -rf "$WORKDIR"
+remove_workdir "$WORKDIR"
 WORKDIR=""
 
 ###############################################################################

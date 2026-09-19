@@ -30,8 +30,10 @@ while True:
 SOCK_PID=$!
 
 RUNNING=1
-# shellcheck disable=SC2064  # SIGLOG is fixed at trap time on purpose
-trap "echo CONT >> '$SIGLOG'" CONT
+# Only TERM is trapped. SIGCONT keeps its default action (resume): bash loses one
+# of two signals delivered back-to-back, so trapping CONT as well would make this
+# stub an unreliable witness. That CONT arrived first is proven instead by the
+# fact that a STOPped process ran this handler at all.
 trap 'echo TERM >> "$SIGLOG"; kill "$SOCK_PID" 2>/dev/null; RUNNING=0' TERM
 
 echo "LogInit: stub server ready" >> "$LOG"
@@ -40,5 +42,6 @@ while [ "$RUNNING" = 1 ]; do
     wait $! 2>/dev/null
 done
 
+echo "EXITED" >> "$SIGLOG"
 echo "LogExit: stub server exiting" >> "$LOG"
 exit 0
