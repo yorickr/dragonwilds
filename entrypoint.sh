@@ -13,6 +13,8 @@ CONFIG_DIR="$INSTALL_DIR/RSDragonwilds/Saved/Config/LinuxServer"
 CONFIG_FILE="$CONFIG_DIR/DedicatedServer.ini"
 LOG_FILE="${LOG_FILE:-$INSTALL_DIR/RSDragonwilds/Saved/Logs/RSDragonwilds.log}"
 OVERRIDE_FILE="$INSTALL_DIR/.autopause"
+SAVEGAMES_DIR="$INSTALL_DIR/RSDragonwilds/Saved/SaveGames"
+BACKUP_DIR="${BACKUP_DIR:-$INSTALL_DIR/backup}"
 
 die() {
     echo "[entrypoint] ERROR: $1" >&2
@@ -40,6 +42,9 @@ validate_env() {
     require_int AUTO_PAUSE_TIMEOUT "${AUTO_PAUSE_TIMEOUT:-900}" 1 604800
     require_int AUTO_PAUSE_IDLE_PPS "${AUTO_PAUSE_IDLE_PPS:-3}" 0 1000000
     require_int AUTO_PAUSE_WAKE_BYTES "${AUTO_PAUSE_WAKE_BYTES:-0}" 0 1000000000
+    require_int BACKUP_INTERVAL "${BACKUP_INTERVAL:-86400}" 1 31536000
+    require_int BACKUP_KEEP "${BACKUP_KEEP:-7}" 1 1000
+    require_int BACKUP_QUIET "${BACKUP_QUIET:-30}" 0 86400
 }
 
 install_or_update() {
@@ -80,6 +85,118 @@ render_config() {
     } > "$CONFIG_FILE"
 
     echo "[entrypoint] Wrote $CONFIG_FILE"
+}
+
+# Epoch seconds of the most recently modified file we back up; 0 if there is
+# nothing to back up yet.
+backup_source_mtime() {
+    local m
+    m="$({ find "$SAVEGAMES_DIR" "$CONFIG_DIR" -type f -printf '%T@\n' 2>/dev/null || true; } \
+        | sort -rn | head -n1 | cut -d. -f1)"
+    echo "${m:-0}"
+}
+
+# Fingerprint of a SaveGames/Config pair: names, sizes and mtimes relative to
+# each root, so the same fingerprint can be taken from the live tree or from a
+# snapshot of it. Changes whenever any file we back up is rewritten, so an
+# identical signature means a snapshot would only duplicate the previous one.
+tree_signature() {
+    local savegames="$1" config="$2"
+    {
+        find "$savegames" -type f -printf 'SaveGames/%P %s %T@\n' 2>/dev/null || true
+        find "$config" -type f -printf 'Config/LinuxServer/%P %s %T@\n' 2>/dev/null || true
+    } | sort | md5sum | cut -d' ' -f1
+}
+
+# Keep the newest $BACKUP_KEEP snapshots. Only our own <date>_<time> directories
+# are candidates: anything else in $BACKUP_DIR (snapshots from the old image
+# layout, a user's own files) is left alone.
+backup_prune() {
+    local keep="${BACKUP_KEEP:-7}" path
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        echo "[backup] pruning $path"
+        rm -rf "$path"
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d \
+                -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9]*' \
+             | sort -r | tail -n +$(( keep + 1 )))
+}
+
+# One snapshot: copy the world and its config into $BACKUP_DIR/<UTC stamp>/.
+# 0 = written, 1 = nothing to do yet (skips are silent, the loop logs once).
+backup_once() {
+    local quiet="${BACKUP_QUIET:-30}" dir="$BACKUP_DIR" sig newest now
+    sig="$(tree_signature "$SAVEGAMES_DIR" "$CONFIG_DIR")"
+    if [ -f "$dir/.last_signature" ] && [ "$sig" = "$(<"$dir/.last_signature")" ]; then
+        return 1
+    fi
+    newest="$(backup_source_mtime)"
+    [ "$newest" -gt 0 ] || return 1
+    now="$(date +%s)"
+    # The server renames the previous save aside and writes a fresh .sav; copying
+    # while that is in flight can catch a torn file, so wait for the files to
+    # settle. The quiet window is far shorter than the 5-minute autosave cadence.
+    [ $(( now - newest )) -ge "$quiet" ] || return 1
+
+    local stamp tmp final n=1
+    stamp="$(date -u +%Y-%m-%d_%H%M%S)"
+    tmp="$dir/.tmp-$stamp"
+    final="$dir/$stamp"
+    while [ -e "$final" ]; do final="$dir/${stamp}_$n"; n=$(( n + 1 )); done
+
+    # Copy aside, then rename into place: a half-written snapshot must never look
+    # like a restorable one.
+    rm -rf "$tmp"
+    mkdir -p "$tmp/SaveGames" "$tmp/Config/LinuxServer" || {
+        echo "[backup] ERROR: cannot create $tmp" >&2
+        return 1
+    }
+    if ! cp -a "$SAVEGAMES_DIR/." "$tmp/SaveGames/" \
+        || ! cp -a "$CONFIG_DIR/." "$tmp/Config/LinuxServer/"; then
+        echo "[backup] ERROR: copy into $tmp failed" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    # Fingerprint the copy, never the source: a save written between the checks
+    # above and this copy would otherwise leave a signature behind that no
+    # snapshot matches, and the loop would write a duplicate on its next tick.
+    local copy_sig
+    copy_sig="$(tree_signature "$tmp/SaveGames" "$tmp/Config/LinuxServer")"
+    mv "$tmp" "$final" || {
+        echo "[backup] ERROR: cannot finalise $final" >&2
+        rm -rf "$tmp"
+        return 1
+    }
+    printf '%s\n' "$copy_sig" > "$dir/.last_signature"
+    echo "[backup] snapshot $final"
+    backup_prune
+    return 0
+}
+
+# Snapshot once at start, then every $BACKUP_INTERVAL seconds. A broken backup
+# must never take the game down with it, so failures log and retry.
+backup_loop() {
+    local interval="${BACKUP_INTERVAL:-86400}" tick last=0 warned=0 now
+    tick="$interval"
+    [ "$tick" -gt 60 ] && tick=60
+    if ! mkdir -p "$BACKUP_DIR"; then
+        echo "[backup] ERROR: cannot create $BACKUP_DIR; backups disabled" >&2
+        return 0
+    fi
+    echo "[backup] every ${interval}s: $SAVEGAMES_DIR + $CONFIG_DIR -> $BACKUP_DIR (keep ${BACKUP_KEEP:-7}, quiet ${BACKUP_QUIET:-30}s)"
+    while :; do
+        now="$(date +%s)"
+        if [ "$last" -eq 0 ] || [ $(( now - last )) -ge "$interval" ]; then
+            if backup_once; then
+                last="$now"
+                warned=0
+            elif [ "$warned" -eq 0 ]; then
+                echo "[backup] nothing to snapshot yet (world unchanged, or a save is in flight)"
+                warned=1
+            fi
+        fi
+        nap "$tick"
+    done
 }
 
 pick_iface() {
@@ -270,8 +387,23 @@ main() {
 
     SERVER_PORT="${SERVER_PORT:-7777}"
 
+    local backups=no
+    if [ "${BACKUP_ENABLED:-false}" = "true" ]; then
+        backup_loop &
+        backups=yes
+    fi
+
     if [ "${AUTO_PAUSE:-true}" != "true" ]; then
-        exec "$INSTALL_DIR/RSDragonwildsServer.sh" -log -Port="$SERVER_PORT"
+        if [ "$backups" = no ]; then
+            exec "$INSTALL_DIR/RSDragonwildsServer.sh" -log -Port="$SERVER_PORT"
+        fi
+        # The snapshot loop outlives the server, so with backups on this path
+        # supervises the server instead of exec'ing it (PID 1 stays this shell,
+        # which already forwards CONT-then-TERM via on_term).
+        start_server
+        local status=0
+        wait "$SERVER_PID" || status=$?
+        exit "$status"
     fi
 
     POLL="${AUTO_PAUSE_POLL:-10}"

@@ -26,8 +26,8 @@ and must pass before a release tag publishes anything:
   exercises its functions directly.
 - **integration** — `tests/integration/run.sh`, which builds the image and runs a
   container against a stub server, asserting config rendering, idle pause, UDP
-  wake, shutdown signal order, and the `OWNER_ID` guard. The real game is never
-  downloaded.
+  wake, shutdown signal order, the `OWNER_ID` guard, and opt-in interval backups.
+  The real game is never downloaded.
 
 ## Notes
 

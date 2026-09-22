@@ -46,3 +46,17 @@ setup() {
     [ "$status" -eq 1 ]
     [[ "$output" == *"AUTO_PAUSE_TIMEOUT must be a number"* ]]
 }
+
+@test "fails on a non-numeric BACKUP_INTERVAL" {
+    export BACKUP_INTERVAL=soon
+    ep validate_env
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"BACKUP_INTERVAL must be a number"* ]]
+}
+
+@test "fails on an out-of-range BACKUP_KEEP" {
+    export BACKUP_KEEP=0
+    ep validate_env
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"BACKUP_KEEP must be between 1 and 1000"* ]]
+}

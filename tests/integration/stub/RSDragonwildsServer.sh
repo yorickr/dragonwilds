@@ -13,6 +13,9 @@ for arg in "$@"; do
 done
 
 mkdir -p "$(dirname "$LOG")"
+# The real server writes the world save; the backup tests assert on a copy of it.
+mkdir -p "$DIR/RSDragonwilds/Saved/SaveGames"
+printf 'world-v1\n' > "$DIR/RSDragonwilds/Saved/SaveGames/World-1.sav"
 touch "$LOG" "$SIGLOG"
 echo "$$" > "$DIR/stub.pid"
 echo "LogInit: stub server starting on port $PORT" >> "$LOG"

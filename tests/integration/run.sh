@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end tests against a real container running a stub server: config
-# rendering, idle pause, UDP wake, shutdown signal order, and the OWNER_ID guard.
+# rendering, idle pause, UDP wake, shutdown signal order, the OWNER_ID guard and
+# opt-in interval backups (snapshot contents, change detection, retention).
 # No game download -- the stub stands in for RSDragonwildsServer.sh.
 #
 # Helpers below are called indirectly (traps, wait_for "$@").
@@ -67,6 +68,15 @@ file_exists() {
     [ -f "$1" ]
 }
 
+contains() { grep -q "$2" "$1"; }
+
+snapshot_dirs() {
+    find "$WORKDIR/data/backup" -maxdepth 1 -mindepth 1 -type d -name '20*' 2>/dev/null || true
+}
+snapshot_count() { snapshot_dirs | wc -l; }
+snapshot_count_is() { [ "$(snapshot_count)" = "$1" ]; }
+newest_snapshot() { snapshot_dirs | sort | tail -n1; }
+
 log_has() {
     docker logs "$CONTAINER" 2>&1 | grep -q "$1"
 }
@@ -97,7 +107,7 @@ docker build -q -t "$TEST_IMAGE" \
     -f "$REPO_ROOT/tests/integration/Dockerfile.test" "$REPO_ROOT/tests/integration" >/dev/null
 
 ###############################################################################
-say "1-4: config rendering, idle pause, UDP wake, shutdown"
+say "1-5: config rendering, idle pause, UDP wake, shutdown, backups stay off by default"
 ###############################################################################
 new_workdir
 CONTAINER="dragonwilds-test-$$"
@@ -193,13 +203,19 @@ if wait_for 30 "the stub to record its pid" file_exists "$WORKDIR/data/stub.pid"
     fi
 fi
 
+if [ ! -d "$WORKDIR/data/backup" ]; then
+    pass "5: no backup directory without BACKUP_ENABLED"
+else
+    fail "5: data/backup was created without BACKUP_ENABLED"
+fi
+
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 CONTAINER=""
 remove_workdir "$WORKDIR"
 WORKDIR=""
 
 ###############################################################################
-say "5: missing OWNER_ID"
+say "6: missing OWNER_ID"
 ###############################################################################
 new_workdir
 CONTAINER="dragonwilds-test-owner-$$"
@@ -211,18 +227,133 @@ OWNER_OUT="$(docker run --name "$CONTAINER" \
     "$TEST_IMAGE" 2>&1)" || OWNER_STATUS=$?
 
 if [ "$OWNER_STATUS" = "1" ]; then
-    pass "5: the container exited 1 without OWNER_ID"
+    pass "6: the container exited 1 without OWNER_ID"
 else
-    fail "5: the container exited $OWNER_STATUS without OWNER_ID, expected 1"
+    fail "6: the container exited $OWNER_STATUS without OWNER_ID, expected 1"
 fi
 if [[ "$OWNER_OUT" == *"OWNER_ID is not set"* ]]; then
-    pass "5b: it printed the OWNER_ID error"
+    pass "6b: it printed the OWNER_ID error"
 else
-    fail "5b: expected an OWNER_ID error, got: $OWNER_OUT"
+    fail "6b: expected an OWNER_ID error, got: $OWNER_OUT"
 fi
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 CONTAINER=""
+
+###############################################################################
+say "7-9: opt-in interval backups, change detection"
+###############################################################################
+new_workdir
+CONTAINER="dragonwilds-test-backup-$$"
+docker run -d --name "$CONTAINER" \
+    -v "$WORKDIR/data:/home/steam/rs_server" \
+    -e OWNER_ID="$OWNER_ID_VALUE" \
+    -e UPDATE_ON_BOOT=false \
+    -e AUTO_PAUSE_TIMEOUT=2 \
+    -e AUTO_PAUSE_POLL=1 \
+    -e BACKUP_ENABLED=true \
+    -e BACKUP_INTERVAL=1 \
+    -e BACKUP_QUIET=0 \
+    "$TEST_IMAGE" >/dev/null
+
+FIRST_SNAPSHOT=""
+if wait_for 60 "a snapshot to appear" snapshot_count_is 1; then
+    pass "7: BACKUP_ENABLED=true wrote a snapshot"
+    FIRST_SNAPSHOT="$(newest_snapshot)"
+    if [ -f "$FIRST_SNAPSHOT/SaveGames/World-1.sav" ] \
+        && contains "$FIRST_SNAPSHOT/SaveGames/World-1.sav" world-v1; then
+        pass "7b: the snapshot holds the world save"
+    else
+        fail "7b: no World-1.sav containing world-v1 under $FIRST_SNAPSHOT"
+    fi
+    if [ -f "$FIRST_SNAPSHOT/Config/LinuxServer/DedicatedServer.ini" ]; then
+        pass "7c: the snapshot holds the rendered config"
+    else
+        fail "7c: no Config/LinuxServer/DedicatedServer.ini under $FIRST_SNAPSHOT"
+    fi
+    if log_has '\[backup\] snapshot'; then
+        pass "7d: the loop logged the snapshot"
+    else
+        fail "7d: no [backup] snapshot line in the container logs"
+    fi
+fi
+
+# Several 1s ticks with nothing writing to the world: the signature is
+# unchanged, so no second snapshot may appear.
+sleep 4
+if snapshot_count_is 1; then
+    pass "8: an unchanged world is not snapshotted again"
+else
+    fail "8: $(snapshot_count) snapshots after 4 idle ticks, expected 1"
+fi
+
+docker exec "$CONTAINER" sh -c \
+    'printf "world-v2\n" >> /home/steam/rs_server/RSDragonwilds/Saved/SaveGames/World-1.sav'
+if wait_for 60 "a changed world to be snapshotted" snapshot_count_is 2; then
+    NEW_SNAPSHOT="$(newest_snapshot)"
+    if [ "$NEW_SNAPSHOT" != "$FIRST_SNAPSHOT" ] \
+        && contains "$NEW_SNAPSHOT/SaveGames/World-1.sav" world-v2; then
+        pass "9: a changed world is snapshotted into a new directory"
+    else
+        fail "9: newest snapshot $NEW_SNAPSHOT is not a new copy of world-v2"
+    fi
+fi
+
+docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+CONTAINER=""
+remove_workdir "$WORKDIR"
+WORKDIR=""
+
+###############################################################################
+say "10-11: retention"
+###############################################################################
+new_workdir
+for stamp in 2026-01-01_000000 2026-01-02_000000 2026-01-03_000000 \
+             2026-01-04_000000 2026-01-05_000000; do
+    mkdir -p "$WORKDIR/data/backup/$stamp/SaveGames"
+    printf 'world\n' > "$WORKDIR/data/backup/$stamp/SaveGames/World-1.sav"
+done
+# Not our layout: a snapshot from the old image, which retention must not touch.
+mkdir -p "$WORKDIR/data/backup/SaveGames_2026-01-06_000000"
+chmod -R 0777 "$WORKDIR"
+
+CONTAINER="dragonwilds-test-retention-$$"
+docker run -d --name "$CONTAINER" \
+    -v "$WORKDIR/data:/home/steam/rs_server" \
+    -e OWNER_ID="$OWNER_ID_VALUE" \
+    -e UPDATE_ON_BOOT=false \
+    -e BACKUP_ENABLED=true \
+    -e BACKUP_INTERVAL=1 \
+    -e BACKUP_QUIET=0 \
+    -e BACKUP_KEEP=3 \
+    "$TEST_IMAGE" >/dev/null
+
+if wait_for 60 "retention to prune the five seeded snapshots down to three" snapshot_count_is 3; then
+    pass "10: BACKUP_KEEP=3 kept three of six snapshots"
+fi
+if [ -d "$WORKDIR/data/backup/2026-01-04_000000" ] \
+    && [ -d "$WORKDIR/data/backup/2026-01-05_000000" ]; then
+    pass "10b: the two oldest survivors are kept"
+else
+    fail "10b: 2026-01-04/2026-01-05 were pruned"
+fi
+if [ ! -d "$WORKDIR/data/backup/2026-01-01_000000" ] \
+    && [ ! -d "$WORKDIR/data/backup/2026-01-02_000000" ] \
+    && [ ! -d "$WORKDIR/data/backup/2026-01-03_000000" ]; then
+    pass "10c: the three oldest snapshots were pruned"
+else
+    fail "10c: 2026-01-01/02/03 survived pruning"
+fi
+if [ -d "$WORKDIR/data/backup/SaveGames_2026-01-06_000000" ]; then
+    pass "11: a foreign directory is left alone"
+else
+    fail "11: the SaveGames_2026-01-06_000000 directory was deleted"
+fi
+
+docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+CONTAINER=""
+remove_workdir "$WORKDIR"
+WORKDIR=""
 
 ###############################################################################
 if [ "$FAILURES" -eq 0 ]; then
