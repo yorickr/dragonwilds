@@ -203,8 +203,9 @@ shutdown signal order, the `OWNER_ID` guard, and opt-in interval backups
 
 ## Versioning
 
-Pushing a `vX.Y.Z` git tag runs the full CI suite and, if it passes, builds and
-pushes `ghcr.io/yorickr/dragonwilds` with semver and `latest` tags.
+Every push to `main` runs the full CI suite and, if it passes, builds and pushes
+`ghcr.io/yorickr/dragonwilds:latest`. Pushing a `vX.Y.Z` git tag does the same
+with semver tags (`X.Y.Z`, `X.Y`, `X`).
 
 ## License
 
