@@ -47,14 +47,45 @@ validate_env() {
     require_int BACKUP_QUIET "${BACKUP_QUIET:-30}" 0 86400
 }
 
+# An update killed mid-flight (docker stop/down during SteamCMD) leaves the
+# appmanifest at StateFlags != 4, and SteamCMD then fails every run with
+# "state is 0x6 after update job". Dropping the manifest and its staging dirs
+# makes the next validate reconcile the existing files instead.
+heal_interrupted_update() {
+    local manifest="$INSTALL_DIR/steamapps/appmanifest_$APP_ID.acf" flags
+    [ -f "$manifest" ] || return 0
+    flags="$(sed -n 's/^[[:space:]]*"StateFlags"[[:space:]]*"\([0-9]*\)".*/\1/p' "$manifest" | head -n1)"
+    [ "$flags" = 4 ] && return 0
+    echo "[entrypoint] appmanifest StateFlags=${flags:-?}: previous update was interrupted, clearing SteamCMD state"
+    rm -rf "$manifest" "$INSTALL_DIR/steamapps/downloading/$APP_ID" \
+        "$INSTALL_DIR/steamapps/temp/$APP_ID" "$INSTALL_DIR/appcache"
+}
+
+# Forward the stop signal to SteamCMD and wait for it, so it can finish writing
+# its state before the container goes away.
+on_term_install() {
+    trap - TERM INT
+    echo "[entrypoint] stop requested during SteamCMD update, interrupting it"
+    kill -INT "$STEAMCMD_PID" 2>/dev/null || true
+    wait "$STEAMCMD_PID" 2>/dev/null || true
+    exit 143
+}
+
 install_or_update() {
     if [ "${UPDATE_ON_BOOT:-true}" = "true" ] || [ ! -f "$INSTALL_DIR/RSDragonwildsServer.sh" ]; then
+        heal_interrupted_update
         echo "[entrypoint] Installing/updating app $APP_ID via SteamCMD..."
         # +app_info_update/+app_info_print first: without it +app_update on this app
         # intermittently fails with "Missing configuration" from a stale appinfo cache.
         "$STEAMCMD" +force_install_dir "$INSTALL_DIR" +login anonymous \
             +app_info_update 1 +app_info_print "$APP_ID" \
-            +app_update "$APP_ID" validate +quit
+            +app_update "$APP_ID" validate +quit &
+        STEAMCMD_PID=$!
+        trap on_term_install TERM INT
+        local status=0
+        wait "$STEAMCMD_PID" || status=$?
+        trap - TERM INT
+        [ "$status" -eq 0 ] || exit "$status"
         chmod +x "$INSTALL_DIR/RSDragonwildsServer.sh"
     fi
 }
